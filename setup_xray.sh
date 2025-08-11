@@ -5,7 +5,7 @@
 #
 # 版本: 2.0
 # 更新:
-#   - 新增 可选的WARP出站分流功能，解决VPS IP被目标网站封锁的问题
+#   - 全流量走 WARP 出站
 #   - 专为 REALITY 协议设计，提供顶级防封锁能力
 #   - 无需域名，无需Nginx/Certbot
 #   - 自动开启 BBR
@@ -62,7 +62,7 @@ check_os() {
 get_user_input() {
   clear
   echo -e "${BLUE}================================================================${PLAIN}"
-  echo -e "${BLUE}    Xray (REALITY) + WARP 出站分流 自动化安装脚本     ${PLAIN}"
+  echo -e "${BLUE}    Xray (REALITY) + WARP 全流量走出口 自动化安装脚本     ${PLAIN}"
   echo -e "${BLUE}================================================================${PLAIN}"
   echo
 
@@ -88,7 +88,7 @@ get_user_input() {
   [ -z "$FLOW" ] && FLOW="xtls-rprx-vision"
 
   echo
-  read -p "是否启用WARP出站分流 (y/n, 推荐, 用于解锁Google字体等): " ENABLE_WARP
+  read -p "是否启用WARP出站 (y/n, 推荐): " ENABLE_WARP
 
   echo
   echo -e "${YELLOW}--- 请确认以下信息 ---${PLAIN}"
@@ -97,7 +97,7 @@ get_user_input() {
   echo -e "自定义UUID:       ${GREEN}${UUID}${PLAIN}"
   echo -e "自定义SNI:        ${GREEN}${CUSTOM_SNI}${PLAIN}"
   echo -e "流控Flow:         ${GREEN}${FLOW}${PLAIN}"
-  echo -e "启用WARP分流:     ${GREEN}${ENABLE_WARP}${PLAIN}"
+  echo -e "启用WARP出站:     ${GREEN}${ENABLE_WARP}${PLAIN}"
   echo
   read -p "信息确认无误？(y/n): " confirm
   if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
@@ -211,61 +211,44 @@ configure_xray() {
     else
         SERVER_NAME=$(echo $DEST_SERVER | cut -d: -f1)
     fi
-    # 根据是否启用WARP来构建不同的outbounds和routing
-    local outbounds_config
-    local routing_config
+
     if [ "$ENABLE_WARP" = "y" ] || [ "$ENABLE_WARP" = "Y" ]; then
         outbounds_config=$(cat <<EOF
-    {
-      "protocol": "freedom",
-      "tag": "direct"
-    },
-    {
-      "protocol": "wireguard",
-      "tag": "warp-out",
-      "settings": {
-        "secretKey": "${WGCF_PRIVATE_KEY}",
-        "address": [ "172.16.0.2/32" ],
-        "peers": [
-          {
-            "publicKey": "${WGCF_PUBLIC_KEY}",
-            "endpoint": "${WGCF_ENDPOINT}"
-          }
-        ]
-      }
-    }
-EOF
-)
-        routing_config=$(cat <<EOF
-  ,
-  "routing": {
-    "rules": [
+{
+  "protocol": "wireguard",
+  "tag": "warp-out",
+  "settings": {
+    "secretKey": "${WGCF_PRIVATE_KEY}",
+    "address": [ "172.16.0.2/32" ],
+    "peers": [
       {
-        "type": "field",
-        "outboundTag": "warp-out",
-        "domain": [
-          "domain:googleapis.com",
-          "domain:gstatic.com",
-          "domain:ggpht.com",
-          "domain:googleusercontent.com",
-          "domain:cdn.jsdelivr.net"
-        ]
-      },
-      {
-        "type": "field",
-        "outboundTag": "direct",
-        "network": "tcp,udp"
+        "publicKey": "${WGCF_PUBLIC_KEY}",
+        "endpoint": "${WGCF_ENDPOINT}"
       }
     ]
   }
+}
+EOF
+)
+        routing_config=$(cat <<EOF
+,
+"routing": {
+  "rules": [
+    {
+      "type": "field",
+      "outboundTag": "warp-out",
+      "network": "tcp,udp"
+    }
+  ]
+}
 EOF
 )
     else
         outbounds_config=$(cat <<EOF
-    {
-      "protocol": "freedom",
-      "settings": {}
-    }
+{
+  "protocol": "freedom",
+  "settings": {}
+}
 EOF
 )
         routing_config=""
@@ -325,10 +308,31 @@ EOF
 }
 
 restart_services() {
-  log "${BLUE}--> 正在启动Xray服务...${PLAIN}"
+  log "${BLUE}--> 正在设置并启动Xray服务（以 root 用户）...${PLAIN}"
+
+  cat > /etc/systemd/system/xray.service <<EOF
+[Unit]
+Description=Xray Service
+Documentation=https://github.com/xtls
+After=network.target nss-lookup.target
+
+[Service]
+ExecStart=/usr/local/bin/xray run -config /usr/local/etc/xray/config.json
+Restart=on-failure
+RestartPreventExitStatus=23
+LimitNPROC=10000
+LimitNOFILE=1000000
+User=root
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  systemctl daemon-reload
   systemctl restart xray
   systemctl enable xray
-  log "${GREEN}Xray服务已启动并设置为开机自启。${PLAIN}"
+
+  log "${GREEN}Xray服务已设置为以 root 用户运行，已启动并设置开机自启。${PLAIN}"
 }
 
 show_results() {
@@ -358,7 +362,7 @@ show_results() {
   echo -e "${BLUE}${VLESS_LINK}${PLAIN}"
   echo
   if [ "$ENABLE_WARP" = "y" ] || [ "$ENABLE_WARP" = "Y" ]; then
-    echo -e "${YELLOW}WARP出站分流功能已开启。访问Google字体等被屏蔽资源时将自动切换IP。${PLAIN}"
+    echo -e "${YELLOW}WARP全流量出站功能已开启。${PLAIN}"
   fi
   echo -e "${GREEN}================================================================${PLAIN}"
 }
@@ -481,24 +485,24 @@ main() {
       check_status
       ;;
     "")
-      check_os
-      install_dependencies
-      get_user_input
-      check_network
-      enable_bbr
-      install_xray
-      if [ "$ENABLE_WARP" = "y" ] || [ "$ENABLE_WARP" = "Y" ]; then
-        configure_warp_outbound
-      fi
-      configure_xray
-      restart_services
-      show_results
-      ;;
-    *)
+  check_os
+  install_dependencies
+  get_user_input
+  check_network
+  enable_bbr
+  install_xray
+  if [ "$ENABLE_WARP" = "y" ] || [ "$ENABLE_WARP" = "Y" ]; then
+    configure_warp_outbound
+  fi
+  configure_xray
+  restart_services
+  show_results
+    ;;
+  *)
       echo -e "${RED}未知参数: $1${PLAIN}"
       show_help
-      ;;
-  esac
+    ;;
+esac
 }
 
 main "$@"
