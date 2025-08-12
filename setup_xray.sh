@@ -437,7 +437,7 @@ check_status() {
       echo -e "${RED}Could not resolve WARP endpoint IP ($warp_endpoint_host). Check DNS or network.${PLAIN}"
       exit 1
     fi
-    echo "Probing for connection to WARP endpoint: ${GREEN}${warp_ip}${PLAIN}"
+    echo -e "Probing for connection to WARP endpoint: ${GREEN}${warp_ip}${PLAIN}"
 
     if sudo ss -nup | grep 'pname=xray' | grep -q "$warp_ip"; then
       echo -e "Live Connection: ${GREEN}Established! Xray is connected to WARP.${PLAIN}"
