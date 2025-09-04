@@ -170,8 +170,8 @@ install_xray() {
     UUID=$(xray uuid)
   fi
   KEYS=$(xray x25519)
-  PRIVATE_KEY=$(echo "$KEYS" | grep "Private key" | awk '{print $3}')
-  PUBLIC_KEY=$(echo "$KEYS" | grep "Public key" | awk '{print $3}')
+  PRIVATE_KEY=$(echo "$KEYS" | grep "PrivateKey:" | awk '{print $2}')
+  PUBLIC_KEY=$(echo "$KEYS" | grep "Password:" | awk '{print $2}')
   SHORT_ID=$(openssl rand -hex 8)
   log "${GREEN}Xray安装及密钥生成完成。${PLAIN}"
 }
@@ -210,6 +210,18 @@ configure_xray() {
         SERVER_NAME="$CUSTOM_SNI"
     else
         SERVER_NAME=$(echo $DEST_SERVER | cut -d: -f1)
+    fi
+
+    # --- reality 私钥校验 ---
+    if [ -z "$PRIVATE_KEY" ]; then
+        log "${RED}错误：Reality协议私钥为空，无法生成有效配置！${PLAIN}"
+        exit 1
+    fi
+
+    # --- reality 公钥校验 ---
+    if [ -z "$PUBLIC_KEY" ]; then
+        log "${RED}错误：Reality协议公钥为空，无法生成有效配置！${PLAIN}"
+        exit 1
     fi
 
     if [ "$ENABLE_WARP" = "y" ] || [ "$ENABLE_WARP" = "Y" ]; then
@@ -298,8 +310,7 @@ EOF
 }
 EOF
     # JSON 校验
-    jq . /usr/local/etc/xray/config.json > /dev/null 2>&1
-    if [ $? -ne 0 ]; then
+    if ! jq . /usr/local/etc/xray/config.json > /dev/null 2>&1; then
         log "${RED}Xray配置文件 JSON 语法错误，请检查参数！${PLAIN}"
         cat /usr/local/etc/xray/config.json
         exit 1
@@ -454,21 +465,50 @@ check_status() {
   echo -e "${GREEN}Status check complete.${PLAIN}"
 }
 
+# --- 动态切换 WARP/Freedom 出站 ---
+switch_warp() {
+  local mode="$1"
+  local config_file="/usr/local/etc/xray/config.json"
+  if [ ! -f "$config_file" ]; then
+    echo -e "${RED}未找到Xray配置文件，无法切换。${PLAIN}"
+    exit 1
+  fi
+
+  if [ "$mode" = "on" ]; then
+    # 启用WARP出站（routing 指向 wireguard）
+    jq '(.outbounds[] | select(.protocol=="wireguard") | .tag) = "warp-out" | .routing.rules = [{"type":"field","outboundTag":"warp-out","network":"tcp,udp"}]' "$config_file" > "${config_file}.tmp" && mv "${config_file}.tmp" "$config_file"
+    systemctl restart xray
+    echo -e "${GREEN}已切换为WARP出站，并重启Xray服务。${PLAIN}"
+  elif [ "$mode" = "off" ]; then
+    # 切换为freedom出站（outbounds 只保留 freedom，删除 routing）
+    jq '.outbounds = [{"protocol":"freedom","settings":{}}] | del(.routing)' "$config_file" > "${config_file}.tmp" && mv "${config_file}.tmp" "$config_file"
+    systemctl restart xray
+    echo -e "${GREEN}已切换为freedom出站，并重启Xray服务。${PLAIN}"
+  else
+    echo -e "${RED}参数错误: switch-warp 仅支持 on/off${PLAIN}"
+    exit 1
+  fi
+}
+
 # --- 主程序 ---
 show_help() {
   echo "用法: bash $0 [参数]"
   echo
   echo "参数说明:"
+  echo "  (无参数)     进入交互式安装流程"
   echo "  help         显示本帮助信息"
   echo "  uninstall    卸载 Xray Reality 及相关配置"
   echo "  status       检查 Xray 和 WARP 的运行状态"
-  echo "  (无参数)     进入交互式安装流程"
+  echo "  switch-warp on    切换为WARP出站"
+  echo "  switch-warp off   切换为freedom出站"
   echo
   echo "示例:"
   echo "  bash $0           # 交互式安装"
   echo "  bash $0 uninstall # 卸载所有配置"
   echo "  bash $0 status    # 检查运行状态"
   echo "  bash $0 help      # 查看帮助"
+  echo "  bash $0 switch-warp on  # 切换为WARP出站"
+  echo "  bash $0 switch-warp off # 切换为freedom出站"
   exit 0
 }
 
@@ -483,6 +523,9 @@ main() {
       ;;
     status)
       check_status
+      ;;
+    switch-warp)
+      switch_warp "$2"
       ;;
     "")
   check_os

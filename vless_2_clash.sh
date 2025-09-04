@@ -215,7 +215,6 @@ proxy-groups:
 # 基于常见的规则集进行简化
 rules:
   # 广告拦截
-  - DOMAIN-KEYWORD,ad,REJECT
   - DOMAIN-SUFFIX,ad.com,REJECT
   # 微软服务
   - DOMAIN-SUFFIX,microsoft.com,Ⓜ️ 微软服务
