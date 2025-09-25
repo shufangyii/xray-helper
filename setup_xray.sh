@@ -203,6 +203,106 @@ configure_warp_outbound() {
 }
 
 
+reconfigure_warp() {
+  log "${BLUE}--> 重新配置WARP出站（wgcf）...${PLAIN}"
+  local tmp_dir=$(mktemp -d)
+  local wgcf_bin="$tmp_dir/wgcf"
+  local config_file="/usr/local/etc/xray/config.json"
+  local backup_cfg="${config_file}.reconfigure-bak.$(date +%s)"
+
+  if [ ! -f "$config_file" ]; then
+    log "${RED}未找到 Xray 配置文件 ${config_file}，请先安装或确认路径。${PLAIN}"
+    rm -rf "$tmp_dir"
+    exit 1
+  fi
+
+  # 下载 wgcf
+  wget -q -O "$wgcf_bin" https://github.com/ViRb3/wgcf/releases/download/v2.2.9/wgcf_2.2.9_linux_amd64
+  if [ $? -ne 0 ]; then
+    log "${RED}wgcf 下载失败。${PLAIN}"
+    rm -rf "$tmp_dir"
+    exit 1
+  fi
+  chmod +x "$wgcf_bin"
+
+  pushd "$tmp_dir" >/dev/null 2>&1
+  # 注册并生成配置（若账号已存在也不会重复创建）
+  "$wgcf_bin" register --accept-tos >/dev/null 2>&1 || true
+  "$wgcf_bin" generate >/dev/null 2>&1
+
+  # 提取键
+  if [ ! -f wgcf-profile.conf ]; then
+    log "${RED}wgcf-profile.conf 未生成，wgcf 运行失败。${PLAIN}"
+    popd >/dev/null 2>&1
+    rm -rf "$tmp_dir"
+    exit 1
+  fi
+
+  local WGCF_PRIVATE_KEY=$(grep "PrivateKey" wgcf-profile.conf | awk '{print $3}')
+  local WGCF_PUBLIC_KEY=$(grep "PublicKey" wgcf-profile.conf | awk '{print $3}')
+
+  if [ -z "$WGCF_PRIVATE_KEY" ] || [ -z "$WGCF_PUBLIC_KEY" ]; then
+    log "${RED}无法从 wgcf-profile.conf 提取密钥，重新配置失败。${PLAIN}"
+    popd >/dev/null 2>&1
+    rm -rf "$tmp_dir"
+    exit 1
+  fi
+
+  # 备份当前配置
+  cp -a "$config_file" "$backup_cfg"
+  log "已备份当前配置到 $backup_cfg"
+
+  # 生成 wireguard outbound JSON (使用 secretKey/address/peers)
+  local warp_json=$(cat <<EOF
+{
+  "protocol": "wireguard",
+  "tag": "warp-out",
+  "settings": {
+    "secretKey": "${WGCF_PRIVATE_KEY}",
+    "address": [ "172.16.0.2/32" ],
+    "peers": [
+      {
+        "publicKey": "${WGCF_PUBLIC_KEY}",
+        "endpoint": "${WGCF_ENDPOINT}"
+      }
+    ]
+  }
+}
+EOF
+)
+
+  # 将 warp_json 插入或替换到 config.json 的 outbounds 中，并写入 routing
+  jq --argjson warp "$warp_json" '
+    .outbounds = (.outbounds // []) | 
+    (if ((.outbounds | map(select(.protocol=="wireguard")) | length) > 0) 
+      then (.outbounds = (.outbounds | map(if .protocol=="wireguard" then $warp else . end))) 
+      else (.outbounds = ((.outbounds // []) + [$warp])) end) |
+    .outbounds = (.outbounds | map(if .protocol=="wireguard" then .tag = "warp-out" else . end)) |
+    .routing = {"rules":[{"type":"field","outboundTag":"warp-out","network":"tcp,udp"}]}
+  ' "$config_file" > "${config_file}.tmp" && mv "${config_file}.tmp" "$config_file"
+
+  local jq_ret=$?
+  popd >/dev/null 2>&1
+  # 清理临时文件（包含 wgcf 相关）
+  rm -rf "$tmp_dir"
+
+  if [ $jq_ret -ne 0 ]; then
+    log "${RED}更新 config.json 时发生错误，已恢复备份。${PLAIN}"
+    mv "$backup_cfg" "$config_file"
+    exit 1
+  fi
+
+  systemctl restart xray
+  if [ $? -ne 0 ]; then
+    log "${RED}重启 xray 失败，已恢复备份配置并停止操作。${PLAIN}"
+    mv "$backup_cfg" "$config_file"
+    exit 1
+  fi
+
+  log "${GREEN}WARP 已重新配置并已重启 Xray。备份保存在 ${backup_cfg}${PLAIN}"
+}
+
+
 configure_xray() {
     log "${BLUE}--> 正在配置Xray...${PLAIN}"
     SERVER_IP=$(curl -s ip.sb)
@@ -473,17 +573,45 @@ switch_warp() {
     echo -e "${RED}未找到Xray配置文件，无法切换。${PLAIN}"
     exit 1
   fi
+  local backup_file="/usr/local/etc/xray/warp_out_backup.json"
 
   if [ "$mode" = "on" ]; then
-    # 启用WARP出站（routing 指向 wireguard）
-    jq '(.outbounds[] | select(.protocol=="wireguard") | .tag) = "warp-out" | .routing.rules = [{"type":"field","outboundTag":"warp-out","network":"tcp,udp"}]' "$config_file" > "${config_file}.tmp" && mv "${config_file}.tmp" "$config_file"
-    systemctl restart xray
-    echo -e "${GREEN}已切换为WARP出站，并重启Xray服务。${PLAIN}"
+    # 启用WARP出站：如果 config 已经有 wireguard 出站，仅设置 tag 与 routing；
+    # 否则尝试从备份恢复（backup_file），若无备份则提示用户重新运行 configure_warp_outbound
+    if jq -e '.outbounds[] | select(.protocol=="wireguard")' "$config_file" >/dev/null 2>&1; then
+      jq '(.outbounds[] | select(.protocol=="wireguard") | .tag) = "warp-out" | .routing = {"rules":[{"type":"field","outboundTag":"warp-out","network":"tcp,udp"}]}' "$config_file" > "${config_file}.tmp" && mv "${config_file}.tmp" "$config_file"
+      systemctl restart xray
+      echo -e "${GREEN}已切换为WARP出站，并重启Xray服务。${PLAIN}"
+    elif [ -f "$backup_file" ]; then
+      # 从备份恢复整个 outbound 对象
+      backup_json=$(cat "$backup_file")
+      if [ -z "$backup_json" ]; then
+        echo -e "${RED}备份文件存在但为空，无法恢复WARP出站。${PLAIN}"
+        exit 1
+      fi
+      # 将 outbounds 替换为备份的 wireguard 配置（保留原有其它出站可能不必要）并添加 routing
+      jq --argjson warp "$backup_json" '.outbounds = [$warp] | .outbounds[0].tag = "warp-out" | .routing = {"rules":[{"type":"field","outboundTag":"warp-out","network":"tcp,udp"}]}' "$config_file" > "${config_file}.tmp" && mv "${config_file}.tmp" "$config_file"
+      systemctl restart xray
+      echo -e "${GREEN}已从备份恢复WARP出站并重启Xray服务。${PLAIN}"
+    else
+      echo -e "${RED}配置中未找到 wireguard 出站，且未发现备份 ($backup_file)。请先运行带 WARP 的安装或手动配置 WARP 出站（configure_warp_outbound）。${PLAIN}"
+      exit 1
+    fi
   elif [ "$mode" = "off" ]; then
-    # 切换为freedom出站（outbounds 只保留 freedom，删除 routing）
-    jq '.outbounds = [{"protocol":"freedom","settings":{}}] | del(.routing)' "$config_file" > "${config_file}.tmp" && mv "${config_file}.tmp" "$config_file"
-    systemctl restart xray
-    echo -e "${GREEN}已切换为freedom出站，并重启Xray服务。${PLAIN}"
+    # 关闭WARP出站：如果存在 wireguard 出站，则备份到 backup_file，然后切换为 freedom 并删除 routing
+    if jq -e '.outbounds[] | select(.protocol=="wireguard")' "$config_file" >/dev/null 2>&1; then
+      # 以紧凑模式导出该 outbound 对象到备份文件
+      jq -c '.outbounds[] | select(.protocol=="wireguard")' "$config_file" > "$backup_file"
+      # 切换为 freedom 出站并删除 routing
+      jq '.outbounds = [{"protocol":"freedom","settings":{}}] | del(.routing)' "$config_file" > "${config_file}.tmp" && mv "${config_file}.tmp" "$config_file"
+      systemctl restart xray
+      echo -e "${GREEN}已切换为freedom出站，并将原 WARP 出站备份到 ${backup_file}。已重启Xray服务。${PLAIN}"
+    else
+      # 即使没有 wireguard，也确保 outbounds 为 freedom，并删除 routing
+      jq '.outbounds = [{"protocol":"freedom","settings":{}}] | del(.routing)' "$config_file" > "${config_file}.tmp" && mv "${config_file}.tmp" "$config_file"
+      systemctl restart xray
+      echo -e "${YELLOW}配置中未发现 WARP 出站；已将 outbounds 设置为 freedom 并重启Xray。${PLAIN}"
+    fi
   else
     echo -e "${RED}参数错误: switch-warp 仅支持 on/off${PLAIN}"
     exit 1
@@ -499,6 +627,7 @@ show_help() {
   echo "  help         显示本帮助信息"
   echo "  uninstall    卸载 Xray Reality 及相关配置"
   echo "  status       检查 Xray 和 WARP 的运行状态"
+  echo "  reconfigure-warp  重新配置 WARP 出站（wgcf），用于修复或重建 WARP 配置"
   echo "  switch-warp on    切换为WARP出站"
   echo "  switch-warp off   切换为freedom出站"
   echo
@@ -509,6 +638,7 @@ show_help() {
   echo "  bash $0 help      # 查看帮助"
   echo "  bash $0 switch-warp on  # 切换为WARP出站"
   echo "  bash $0 switch-warp off # 切换为freedom出站"
+  echo "  bash $0 reconfigure-warp  # 重新生成并配置 WARP 出站（故障排查/重置）"
   exit 0
 }
 
@@ -523,6 +653,9 @@ main() {
       ;;
     status)
       check_status
+      ;;
+    reconfigure-warp)
+      reconfigure_warp
       ;;
     switch-warp)
       switch_warp "$2"
